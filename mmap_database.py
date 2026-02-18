@@ -27,6 +27,7 @@ from vnpy.trader.setting import SETTINGS
 
 
 BASE_DATETIME: datetime = datetime(2021, 1, 1, tzinfo=DB_TZ).replace(tzinfo=None)
+BASE_DATE = BASE_DATETIME.date()
 INTERVAL_SECONDS: dict[Interval, int] = {
     Interval.MINUTE: 60,
     Interval.HOUR: 3600,
@@ -44,8 +45,28 @@ for interval, alias in INTERVAL_ALIASES.items():
     ALIAS_TO_INTERVAL[alias] = interval
     ALIAS_TO_INTERVAL[interval.value] = interval
 
-BAR_STRUCT: struct.Struct = struct.Struct("<q q q q q q q q")
+TRADING_MINUTE_SEGMENTS: list[tuple[int, int]] = [
+    (9 * 60 + 31, 11 * 60 + 30),
+    (13 * 60 + 1, 15 * 60 + 0),
+]
+TRADING_MINUTES_PER_DAY: int = sum(
+    end - start + 1 for start, end in TRADING_MINUTE_SEGMENTS
+)
+
+BAR_STRUCT: struct.Struct = struct.Struct("<q i i i i q q q")
 BAR_RECORD_SIZE: int = BAR_STRUCT.size
+BAR_DTYPE = np.dtype(
+    [
+        ("offset_sec", "<i8"),
+        ("open_price", "<i4"),
+        ("high_price", "<i4"),
+        ("low_price", "<i4"),
+        ("close_price", "<i4"),
+        ("volume", "<i8"),
+        ("turnover", "<i8"),
+        ("open_interest", "<i8"),
+    ]
+)
 EMPTY_BAR_RECORD: bytes = BAR_STRUCT.pack(-1, 0, 0, 0, 0, 0, 0, 0)
 PRICE_SCALE: int = max(int(SETTINGS.get("mmapdb.price_scale", 1)), 1)
 
@@ -109,7 +130,13 @@ class Database(BaseDatabase):
                 continue
 
             offset_sec: int = int((dt - BASE_DATETIME).total_seconds())
-            slot_index: int = max(offset_sec // seconds, 0)
+            if bar.interval == Interval.MINUTE:
+                slot_index = self._minute_slot_index(dt)
+                if slot_index is None:
+                    continue
+            else:
+                slot_index = max(offset_sec // seconds, 0)
+
             path: Path = self._bar_file_path(bar.symbol, bar.exchange, bar.interval)
 
             record = (
@@ -157,14 +184,17 @@ class Database(BaseDatabase):
         if end_dt <= start_dt:
             return []
 
-        start_slot: int = max(
-            int((start_dt - BASE_DATETIME).total_seconds()) // seconds,
-            0,
-        )
-        end_slot: int = max(
-            int(math.ceil((end_dt - BASE_DATETIME).total_seconds() / seconds)),
-            0,
-        )
+        if interval == Interval.MINUTE:
+            start_slot, end_slot = self._minute_slot_range(start_dt, end_dt)
+        else:
+            start_slot = max(
+                int((start_dt - BASE_DATETIME).total_seconds()) // seconds,
+                0,
+            )
+            end_slot = max(
+                int(math.ceil((end_dt - BASE_DATETIME).total_seconds() / seconds)),
+                0,
+            )
 
         records: list[BarSlot] = list(
             self._read_bar_range(path, start_slot, end_slot)
@@ -296,25 +326,24 @@ class Database(BaseDatabase):
                 if not view:
                     return
 
-                raw = np.frombuffer(view, dtype="<i8").copy()
+                raw = np.frombuffer(view, dtype=BAR_DTYPE).copy()
                 del view
                 if not len(raw):
                     return
 
-                raw = raw.reshape(-1, 8)
                 for row in raw:
-                    if row[0] < 0:
+                    if int(row["offset_sec"]) < 0:
                         continue
 
                     yield BarSlot(
-                        offset_sec=int(row[0]),
-                        open_price=self._decode_price(int(row[1])),
-                        high_price=self._decode_price(int(row[2])),
-                        low_price=self._decode_price(int(row[3])),
-                        close_price=self._decode_price(int(row[4])),
-                        volume=float(row[5]),
-                        turnover=float(row[6]),
-                        open_interest=float(row[7]),
+                        offset_sec=int(row["offset_sec"]),
+                        open_price=self._decode_price(int(row["open_price"])),
+                        high_price=self._decode_price(int(row["high_price"])),
+                        low_price=self._decode_price(int(row["low_price"])),
+                        close_price=self._decode_price(int(row["close_price"])),
+                        volume=float(row["volume"]),
+                        turnover=float(row["turnover"]),
+                        open_interest=float(row["open_interest"]),
                     )
 
     # ----------------------------------------------------------------------
@@ -330,7 +359,7 @@ class Database(BaseDatabase):
         self._resize_file(path, required_records, BAR_RECORD_SIZE, EMPTY_BAR_RECORD)
 
         slots = np.fromiter((slot for slot, _ in entries), dtype=np.int64)
-        records = np.array([record for _, record in entries], dtype="<i8")
+        records = np.array([record for _, record in entries], dtype=BAR_DTYPE)
 
         segments: list[tuple[int, bytes]] = []
         start_idx = 0
@@ -392,20 +421,19 @@ class Database(BaseDatabase):
 
             with mmap.mmap(file_.fileno(), 0, access=mmap.ACCESS_READ) as mm:
                 data = memoryview(mm)
-                raw = np.frombuffer(data, dtype="<i8").copy()
+                raw = np.frombuffer(data, dtype=BAR_DTYPE).copy()
                 del data
                 if not len(raw):
                     return {"start": None, "end": None, "count": 0}
 
-                raw = raw.reshape(-1, 8)
-                valid = raw[raw[:, 0] >= 0]
-                if not len(valid):
+                valid_mask = raw["offset_sec"] >= 0
+                if not np.any(valid_mask):
                     return {"start": None, "end": None, "count": 0}
 
-                offsets = valid[:, 0].astype(np.int64)
+                offsets = raw["offset_sec"][valid_mask].astype(np.int64)
                 start_dt = BASE_DATETIME + timedelta(seconds=int(offsets.min()))
                 end_dt = BASE_DATETIME + timedelta(seconds=int(offsets.max()))
-                count = int(len(valid))
+                count = int(np.count_nonzero(valid_mask))
 
         return {"start": start_dt, "end": end_dt, "count": count}
 
@@ -422,13 +450,12 @@ class Database(BaseDatabase):
 
             with mmap.mmap(file_.fileno(), 0, access=mmap.ACCESS_READ) as mm:
                 data = memoryview(mm)
-                raw = np.frombuffer(data, dtype="<i8").copy()
+                raw = np.frombuffer(data, dtype=BAR_DTYPE).copy()
                 del data
                 if not len(raw):
                     return 0
 
-                raw = raw.reshape(-1, 8)
-                total = int(np.count_nonzero(raw[:, 0] >= 0))
+                total = int(np.count_nonzero(raw["offset_sec"] >= 0))
 
         return total
 
@@ -442,6 +469,42 @@ class Database(BaseDatabase):
             return Exchange(value)
         except ValueError:
             return None
+
+    # ----------------------------------------------------------------------
+    @staticmethod
+    def _minute_slot_index(dt: datetime) -> int | None:
+        day_offset = (dt.date() - BASE_DATE).days
+        if day_offset < 0:
+            return None
+
+        minute_offset = Database._minute_offset_in_day(dt)
+        if minute_offset is None:
+            return None
+
+        return day_offset * TRADING_MINUTES_PER_DAY + minute_offset
+
+    # ----------------------------------------------------------------------
+    @staticmethod
+    def _minute_slot_range(start_dt: datetime, end_dt: datetime) -> tuple[int, int]:
+        start_day = (start_dt.date() - BASE_DATE).days
+        end_day = (end_dt.date() - BASE_DATE).days
+
+        start_slot = max(start_day * TRADING_MINUTES_PER_DAY, 0)
+        end_slot = max((end_day + 1) * TRADING_MINUTES_PER_DAY, 0)
+
+        return start_slot, end_slot
+
+    # ----------------------------------------------------------------------
+    @staticmethod
+    def _minute_offset_in_day(dt: datetime) -> int | None:
+        minute_value = dt.hour * 60 + dt.minute
+        offset = 0
+        for start, end in TRADING_MINUTE_SEGMENTS:
+            if start <= minute_value <= end:
+                return offset + (minute_value - start)
+            offset += end - start + 1
+
+        return None
 
     # ----------------------------------------------------------------------
     @staticmethod
